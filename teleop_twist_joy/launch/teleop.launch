@@ -1,0 +1,8 @@
+<launch>
+  <node pkg="joy" type="joy_node" name="joy_node" output="screen"/>
+
+  <node pkg="teleop_twist_joy" type="teleop_node" name="teleop_twist_joy" output="screen">
+    <rosparam command="load" file="$(find teleop_twist_joy)/config/gulikit.config.yaml"/>
+  </node>
+</launch>
+

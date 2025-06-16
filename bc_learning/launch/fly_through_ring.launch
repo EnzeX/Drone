@@ -1,0 +1,8 @@
+<launch>
+  <!-- 图像获取节点 -->
+  <node name="image_pub" pkg="bc_learning" type="airsim_image_pub.py" output="screen"/>
+
+  <!-- 控制逻辑节点 -->
+  <node name="circle_tracker" pkg="bc_learning" type="fly_through_circle.py" output="screen"/>
+</launch>
+

@@ -1,0 +1,9 @@
+teleop_twist_joy:
+  axis_linear: 1        # 左摇杆上下控制前后
+  axis_angular: 2       # 右摇杆左右控制旋转
+  enable_button: 7      # R肩，按住激活控制
+  enable_turbo_button: 6  # L肩，加速模式
+
+  scale_linear: 1.0
+  scale_angular: 0.8
+  scale_linear_turbo: 2.0

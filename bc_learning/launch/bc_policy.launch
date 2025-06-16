@@ -1,0 +1,4 @@
+<launch>
+  <node pkg="bc_learning" type="run_policy.py" name="bc_policy_node" output="screen"/>
+</launch>
+

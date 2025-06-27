@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import rospy
 from sensor_msgs.msg import Image
-from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 import torch
 import torch.nn as nn
@@ -13,7 +13,7 @@ import os
 from train_bc import PolicyNet  # 复用模型定义
 
 # 参数设置
-MODEL_PATH = os.path.expanduser("~/airsim_bc_data/bc_policy.pth")
+MODEL_PATH = os.path.expanduser("~/bc_data/airsim_bc_policy.pth")
 IMAGE_TOPIC = "/airsim_node/drone1/front_center/Scene"
 ODOM_TOPIC = "/airsim_node/drone1/odom_local_ned"
 CMD_TOPIC = "/cmd_vel"
@@ -39,6 +39,7 @@ def odom_callback(msg):
     v = msg.twist.twist.linear
     latest_vel = [v.x, v.y, v.z]
     latest_alt = -msg.pose.pose.position.z  # AirSim Z 为负，Tello 高度为正
+    
 def image_callback(msg):
     global latest_vel, latest_alt
     if latest_vel is None or latest_alt is None:
@@ -46,7 +47,7 @@ def image_callback(msg):
         return
     try:
         img = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        vx, vy, vz = [0 if abs(v) < 0.01 else v for v in latest_vel]
+        vx, vy, vz = [0 if abs(v) < 0.01 else round(v, 2) for v in latest_vel]
         alt = latest_alt
         
         img_tensor = transform(img).unsqueeze(0)  # shape: (1, 3, 120, 160)
@@ -76,11 +77,13 @@ def image_callback(msg):
 
 
 if __name__ == "__main__":
-    rospy.init_node("bc_policy_node")
+    rospy.init_node("airsim_bc_policy")
     pub = rospy.Publisher(CMD_TOPIC, Twist, queue_size=1)
+    
     rospy.Subscriber(IMAGE_TOPIC, Image, image_callback)
     rospy.Subscriber(ODOM_TOPIC, Odometry, odom_callback)
+    
     rospy.loginfo("Behavior Cloning policy is running...")
     rospy.on_shutdown(cv2.destroyAllWindows)
     rospy.spin()
-
+    

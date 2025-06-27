@@ -13,8 +13,8 @@ import numpy as np
 BATCH_SIZE = 32
 EPOCHS = 10
 LEARNING_RATE = 1e-3
-DATA_PATH = os.path.expanduser("~/airsim_bc_data/expert_data.pkl")
-SAVE_PATH = os.path.expanduser("~/airsim_bc_data/bc_policy.pth")
+DATA_PATH = os.path.expanduser("~/bc_data/airsim_expert_data.pkl")
+SAVE_PATH = os.path.expanduser("~/bc_data/airsim_bc_policy.pth")
 
 # 数据集定义
 class ExpertDataset(Dataset):

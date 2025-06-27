@@ -11,6 +11,7 @@ import os
 
 bridge = CvBridge()
 data = []
+
 latest_image = None
 latest_vel = None
 latest_alt = None
@@ -29,7 +30,7 @@ def cmd_callback(msg):
         data.append((latest_image.copy(), action, latest_vel.copy(), latest_alt))
         rospy.loginfo(f"Saved action: {action}, vel: {latest_vel}, alt: {latest_alt}, total: {len(data)}")
         # 显示图像 + 状态信息
-        vx, vy, vz = [0 if abs(v) < 0.01 else v for v in latest_vel]
+        vx, vy, vz = [0 if abs(v) < 0.01 else round(v, 2) for v in latest_vel]
         debug_img = latest_image.copy()
         text = f"VEL: [{vx:.2f}, {vy:.2f}, {vz:.2f}]  ALT: {latest_alt:.2f}"
         cv2.putText(debug_img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -56,9 +57,9 @@ if __name__ == "__main__":
         while not rospy.is_shutdown():
             rate.sleep()
     finally:
-        save_dir = os.path.expanduser("~/airsim_bc_data")
+        save_dir = os.path.expanduser("~/bc_data")
         os.makedirs(save_dir, exist_ok=True)
-        filename = os.path.join(save_dir, f"expert_data.pkl")
+        filename = os.path.join(save_dir, f"airsim_expert_data.pkl")
         with open(filename, "wb") as f:
             pickle.dump(data, f)
         rospy.loginfo(f"Saved {len(data)} samples to {filename}")

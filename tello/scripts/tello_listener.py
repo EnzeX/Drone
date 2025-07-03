@@ -34,14 +34,20 @@ rospy.init_node("tello_listener")
 rospy.Subscriber("/cmd_vel", Twist, cmd_vel_callback)
 rospy.Subscriber("/tello_event", String, event_callback)
 # 发布速度和高度
+img_pub = rospy.Publisher("/tello/image_raw", Image, queue_size=1)
 vel_pub = rospy.Publisher("/tello/velocity", Vector3, queue_size=1)
 alt_pub = rospy.Publisher("/tello/height", Float32, queue_size=1)
-img_pub = rospy.Publisher("/tello/image_raw", Image, queue_size=1)
+att_pub = rospy.Publisher("/tello/attitude", Vector3, queue_size=1)
+acc_pub = rospy.Publisher("/tello/acceleration", Vector3, queue_size=1)
 bridge = CvBridge()
 
 rate = rospy.Rate(10)
 while not rospy.is_shutdown():
     try:
+        # 图像发布
+        frame = tello.get_frame_read().frame
+        img_msg = bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+        img_pub.publish(img_msg)
         # 速度与高度发布
         vx = tello.get_speed_x() / 100.0
         vy = tello.get_speed_y() / 100.0
@@ -49,11 +55,18 @@ while not rospy.is_shutdown():
         h = tello.get_height() / 100.0
         vel_pub.publish(Vector3(x=vx, y=vy, z=vz))
         alt_pub.publish(h)
-        
-        # 图像发布
-        frame = tello.get_frame_read().frame
-        img_msg = bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-        img_pub.publish(img_msg)
+        # 姿态发布
+        att_pub.publish(Vector3(
+            x=tello.get_pitch(),
+            y=tello.get_roll(),
+            z=tello.get_yaw()
+        ))
+        # 加速度发布
+        acc_pub.publish(Vector3(
+            x=tello.get_acceleration_x(),
+            y=tello.get_acceleration_y(),
+            z=tello.get_acceleration_z()
+        ))
         
     except Exception as e:
         rospy.logwarn(f"读取速度/高度失败: {e}")

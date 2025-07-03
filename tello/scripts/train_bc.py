@@ -13,7 +13,7 @@ import numpy as np
 BATCH_SIZE = 32
 EPOCHS = 15
 LEARNING_RATE = 1e-3
-DATA_PATH = os.path.expanduser("~/bc_data/tello_expert_data.pkl")
+DATA_PATH = os.path.expanduser("~/bc_data/tello_merged_expert_data.pkl")
 SAVE_PATH = os.path.expanduser("~/bc_data/tello_bc_policy.pth")
 
 # 数据集定义
@@ -32,9 +32,9 @@ class ExpertDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        image, action, vel, alt = self.data[idx]
+        image, action, vel, alt, att, acc = self.data[idx]
         image = self.transform(image)
-        state = torch.tensor(vel + [alt], dtype=torch.float32)  # [vx, vy, vz, alt]
+        state = torch.tensor(vel + [alt] + att + acc, dtype=torch.float32)  # [vx, vy, vz, alt]
         action = torch.tensor(action, dtype=torch.float32)
         return image, state, action
 
@@ -52,7 +52,7 @@ class PolicyNet(nn.Module):
         self.conv_out_dim = conv_out.shape[1]
 
         self.fc = nn.Sequential(
-            nn.Linear(self.conv_out_dim + 4, 128), nn.ReLU(),
+            nn.Linear(self.conv_out_dim + 10, 128), nn.ReLU(),
             nn.Linear(128, 4)
         )
 

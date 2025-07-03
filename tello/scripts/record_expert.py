@@ -15,19 +15,21 @@ data = []
 latest_image = None
 latest_vel = None
 latest_alt = None
-
-def image_callback(msg):
-    global latest_image
-    try:
-        latest_image = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-    except:
-        rospy.logwarn("Failed to convert image")
+latest_att = None
+latest_acc = None
 
 def cmd_callback(msg):
-    global latest_image, latest_vel, latest_alt
-    if latest_image is not None and latest_vel is not None and latest_alt is not None:
+    global latest_image, latest_vel, latest_alt, latest_att, latest_acc
+    if latest_image is not None and latest_vel is not None and latest_alt is not None and latest_att is not None and latest_acc is not None:
         action = [msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z]
-        data.append((latest_image.copy(), action, latest_vel.copy(), latest_alt))
+        data.append((
+            latest_image.copy(),       # 图像
+            action,                    # 动作
+            latest_vel.copy(),         # 速度
+            latest_alt,                # 高度
+            latest_att.copy(),         # 姿态
+            latest_acc.copy()          # 加速度
+        ))
         rospy.loginfo(f"Saved action: {action}, vel: {latest_vel}, alt: {latest_alt}, total: {len(data)}")
         # 显示图像 + 状态信息
         vx, vy, vz = [0 if abs(v) < 0.01 else round(v, 2) for v in latest_vel]
@@ -37,6 +39,13 @@ def cmd_callback(msg):
         cv2.imshow("Recording Expert", debug_img)
         cv2.waitKey(1)
 
+def image_callback(msg):
+    global latest_image
+    try:
+        latest_image = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+    except:
+        rospy.logwarn("Failed to convert image")
+
 def vel_callback(msg):
     global latest_vel
     latest_vel = [msg.x, msg.y, msg.z]
@@ -44,6 +53,14 @@ def vel_callback(msg):
 def alt_callback(msg):
     global latest_alt
     latest_alt = msg.data
+
+def att_callback(msg):
+    global latest_att
+    latest_att = [msg.x, msg.y, msg.z]
+
+def acc_callback(msg):
+    global latest_acc
+    latest_acc = [msg.x, msg.y, msg.z]
     
 if __name__ == "__main__":
     rospy.init_node("expert_data_recorder", anonymous=True)
@@ -52,6 +69,8 @@ if __name__ == "__main__":
     rospy.Subscriber("/cmd_vel", Twist, cmd_callback)
     rospy.Subscriber("/tello/velocity", Vector3, vel_callback)
     rospy.Subscriber("/tello/height", Float32, alt_callback)
+    rospy.Subscriber("/tello/attitude", Vector3, att_callback)
+    rospy.Subscriber("/tello/acceleration", Vector3, acc_callback)
     
     rospy.loginfo("Recording expert data... Ctrl+C to stop.")
     rate = rospy.Rate(10)  # 防止 CPU 空转
@@ -62,7 +81,7 @@ if __name__ == "__main__":
     finally:
         save_dir = os.path.expanduser("~/bc_data")
         os.makedirs(save_dir, exist_ok=True)
-        filename = os.path.join(save_dir, f"tello_expert_data.pkl")
+        filename = os.path.join(save_dir, f"tello_expert_data_{int(time.time())}.pkl")
         with open(filename, "wb") as f:
             pickle.dump(data, f)
         rospy.loginfo(f"Saved {len(data)} samples to {filename}")

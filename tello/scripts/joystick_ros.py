@@ -22,12 +22,12 @@ event_pub = rospy.Publisher("/tello_event", String, queue_size=1)
 rate = rospy.Rate(20)
 
 # 默认动作：vx, vy, vz, yaw（前后、左右、上下、转向）
-speed = 1.5
-deadzone = 0.2
+speed = 0.3
+deadzone = 0.05
 
 def scale(val):
     """将 [-1, 1] 映射为 [-speed, speed]，应用死区"""
-    return int(val * speed) if abs(val) > deadzone else 0
+    return val * speed if abs(val) > deadzone else 0
 
 
 try:

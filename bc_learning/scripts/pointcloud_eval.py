@@ -29,22 +29,24 @@ import airsim
 import cv2
 import numpy as np
 
-from orchard_env import VIEWPOINT_MIN_DIST, VIEWPOINT_MAX_DIST
+from orchard_env import VIEWPOINT_MIN_DIST, VIEWPOINT_MAX_DIST, GROUND_Z_CLEARANCE_M
 
 # ── Tunables ────────────────────────────────────────────────────────────────
 VOXEL_SIZE        = 0.15   # m - voxel downsampling to control memory usage
 PIXEL_STRIDE      = 2      # sample one pixel every N pixels to reduce cost
 MAX_RANGE_M       = 12.0   # discard points beyond this range; far depth is noisy
 MIN_RANGE_M       = 0.3
-GROUND_CLEARANCE  = 0.5    # world NED z < -0.5 counts as tree; filters ground
+# Ground threshold is shared with orchard_env.py's depth-blob ground filter
+# (GROUND_Z_CLEARANCE_M) rather than duplicated here, so the two ground
+# definitions can't drift apart.
 MAX_HEIGHT_M      = 8.0    # z > -8 filters sky and outliers
 TREE_ASSIGN_RADIUS = 2.5   # m - point must be within this horizontal distance
                             # of a tree center to count as that tree's surface
-N_AZIMUTH_BINS    = 36     # one bin per 10 degrees
-N_AZ_BINS         = 36     # 与 azimuth coverage 保持一致
+N_AZIMUTH_BINS    = 36     # one bin per 10 degrees (used for both surface-coverage
+                            # bins and revisit-tracking bins — one azimuth resolution)
 REVISIT_GAP_STEPS = 15     # 同一 bin 两次观测间隔超过此步数 → 算两次独立访问
 N_HEIGHT_BINS     = 8      # 高度分箱数;与方位一起构成 36×8=288 格展开网格
-HEIGHT_MIN_M      = 0.5    # 与 GROUND_CLEARANCE 一致
+HEIGHT_MIN_M      = GROUND_Z_CLEARANCE_M
 HEIGHT_MAX_M      = 5.0    # 实测树高:基准 b≈4.8,× scale(0.85–1.15)→ 4.1–5.5
 N_CELLS           = N_AZIMUTH_BINS * N_HEIGHT_BINS
 COV_SNAPSHOT_EVERY = 10    # 每 N 步记录一次覆盖率-预算曲线采样点
@@ -175,7 +177,7 @@ class PointCloudAccumulator:
         pts_w = pts_cam @ R.T + cam_pos
 
         # Filter ground, outliers, and far points by true ray distance.
-        keep = (pts_w[:, 2] < -GROUND_CLEARANCE) & (pts_w[:, 2] > -MAX_HEIGHT_M) & (rng < MAX_RANGE_M)
+        keep = (pts_w[:, 2] < -GROUND_Z_CLEARANCE_M) & (pts_w[:, 2] > -MAX_HEIGHT_M) & (rng < MAX_RANGE_M)
         pts_w = pts_w[keep]
         if len(pts_w) == 0:
             self._accumulate_radius(p.x_val, p.y_val)
@@ -246,7 +248,7 @@ class PointCloudAccumulator:
             if not facing:
                 continue
             ang = math.atan2(drone_y - ty, drone_x - tx)
-            k = int((ang + math.pi) / (2 * math.pi) * N_AZ_BINS) % N_AZ_BINS
+            k = int((ang + math.pi) / (2 * math.pi) * N_AZIMUTH_BINS) % N_AZIMUTH_BINS
             self._bin_obs_steps.setdefault(ti, {}).setdefault(k, []).append(self._step_idx)
 
         if self._step_idx % COV_SNAPSHOT_EVERY == 0:
@@ -323,7 +325,7 @@ class PointCloudAccumulator:
                 "cell_coverage_pct": round(100.0 * len(cells[i]) / N_CELLS, 2),
                 "view_dir_coverage_pct": round(100.0 * len(views[i]) / N_AZIMUTH_BINS, 1),
                 "surface_points": counts[i],
-                "point_density_per_bin": round(counts[i] / N_AZ_BINS, 1),
+                "point_density_per_bin": round(counts[i] / N_AZIMUTH_BINS, 1),
                 **self._revisit_stats(i),
                 "mean_orbit_radius_m": round(float(np.mean(radii)), 2) if radii else None,
                 "min_orbit_radius_m": round(float(np.min(radii)), 2) if radii else None,

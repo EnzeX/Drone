@@ -12,18 +12,17 @@ Approach dx/dy is privileged GT in sim, gated to 0 inside the orbit radius; in
 deployment it comes from an onboard tree detector / depth blob (not GPS).
 """
 
+import glob
 import os
+import re
 import zipfile
 
-import gymnasium as gym
-import numpy as np
 import torch
-import torch.nn as nn
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
-from orchard_env import IMG_C, IMG_H, IMG_W, N_IMG, OBS_DIM, STATE_DIM, OrchardEnv
+from orchard_env import OBS_DIM, OrchardEnv
+from rl_policy import ImageStateFeatureExtractor
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PATHS / RUN CONFIG
@@ -31,13 +30,27 @@ from orchard_env import IMG_C, IMG_H, IMG_W, N_IMG, OBS_DIM, STATE_DIM, OrchardE
 SAVE_DIR   = os.path.expanduser("~/bc_data/rl_models")
 MODEL_NAME = "slalom_ppo_lstm"          # 新血统,不会覆盖 PPO/depth 的 checkpoint
 
+
+def _find_latest_checkpoint(save_dir, model_name):
+    """Newest f"{model_name}_<steps>_steps.zip" in save_dir (path without the
+    .zip extension), or None if none exist. Avoids hand-editing a step count
+    into a path literal every time training is resumed from a newer save."""
+    best_path, best_steps = None, -1
+    for path in glob.glob(os.path.join(save_dir, f"{model_name}_*_steps.zip")):
+        m = re.search(r"_(\d+)_steps\.zip$", path)
+        if m and int(m.group(1)) > best_steps:
+            best_steps, best_path = int(m.group(1)), path[:-len(".zip")]
+    return best_path
+
+
 # Warm-start: 把旧 PPO depth run 的视觉主干 (features_extractor) 灌进来
 WARMSTART_FROM_PPO = False
-PPO_CKPT_PATH = os.path.expanduser("~/bc_data/rl_models/slalom_ppo_depth_1000000_steps")
+PPO_CKPT_PATH = _find_latest_checkpoint(SAVE_DIR, "slalom_ppo_depth")
 
 # Resume 一个 RecurrentPPO run(第一次不存在 → 走 fresh)
 RESUME_FROM_CHECKPOINT = True
-CHECKPOINT_PATH = os.path.expanduser("~/bc_data/rl_models/slalom_ppo_lstm_1400000_steps")
+CHECKPOINT_PATH = _find_latest_checkpoint(SAVE_DIR, MODEL_NAME)
+# CHECKPOINT_PATH = os.path.expanduser("~/bc_data/rl_models/slalom_ppo_lstm_1400000_steps")
 
 USE_RENDER = False
 DEBUG_STARTUP_CHECK = False
@@ -47,43 +60,14 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FEATURE EXTRACTOR  (unchanged — 4-channel RGBD CNN + state encoder)
-# ─────────────────────────────────────────────────────────────────────────────
-class ImageStateFeatureExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 128):
-        super().__init__(observation_space, features_dim)
-        self.conv = nn.Sequential(
-            nn.Conv2d(IMG_C, 32, 5, stride=2), nn.ReLU(),
-            nn.Conv2d(32, 64, 5, stride=2), nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-        )
-        dummy = torch.zeros(1, IMG_C, IMG_H, IMG_W)
-        conv_out_dim = self.conv(dummy).view(1, -1).shape[1]
-        self.image_bottleneck = nn.Sequential(nn.Linear(conv_out_dim, 96), nn.ReLU())
-        self.state_encoder = nn.Sequential(
-            nn.Linear(STATE_DIM, 32), nn.ReLU(),
-            nn.Linear(32, 32), nn.ReLU(),
-        )
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        img_flat = obs[:, :N_IMG]
-        state    = obs[:, N_IMG:]
-        img = img_flat.view(-1, IMG_C, IMG_H, IMG_W)
-        img_feat = self.conv(img).view(img.size(0), -1)
-        img_enc  = self.image_bottleneck(img_feat)
-        st_enc   = self.state_encoder(state)
-        return torch.cat([img_enc, st_enc], dim=1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  WARM-START  (视觉主干 only — LSTM + heads 保持随机)
 # ─────────────────────────────────────────────────────────────────────────────
 def warmstart_extractor_from_ppo(recurrent_model, ppo_ckpt_no_ext):
     """只把 features_extractor.* 从旧 PPO checkpoint 拷进 RecurrentPPO;LSTM 和
     policy/value head 保持随机初始化,和 LSTM 一起 co-adapt。obs 形状没变,extractor
     每个张量都 shape 对齐。"""
-    if not os.path.exists(ppo_ckpt_no_ext + ".zip"):
-        print(f"[WARMSTART][WARN] {ppo_ckpt_no_ext}.zip 不存在 — 跳过,从零训练。")
+    if not ppo_ckpt_no_ext or not os.path.exists(ppo_ckpt_no_ext + ".zip"):
+        print(f"[WARMSTART][WARN] 找不到 PPO checkpoint ({ppo_ckpt_no_ext}) — 跳过,从零训练。")
         return
     with zipfile.ZipFile(ppo_ckpt_no_ext + ".zip") as archive:
         with archive.open("policy.pth") as f:

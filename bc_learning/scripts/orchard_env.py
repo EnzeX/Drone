@@ -6,14 +6,17 @@ Gymnasium environment for the AirSim orchard inspection task.
 
 Built directly on the working ball-collection version.
 Tree coverage viewpoints provide the primary learning signal.
-Apple gaze code is commented out.
 
-Reward summary:
+Reward summary (see _compute_reward for exact weights/constants):
   PRIMARY:
-    +1.0  per tree coverage viewpoint reached while facing the tree
-    +2.0  tree completion bonus
-    +small yaw shaping while orbiting the current target tree
-    −0.3  one-shot trunk zone entry penalty
+    +1.0  per tree coverage viewpoint reached (right distance band + facing + new sector)
+    +2.0  tree completion bonus (all VIEWPOINT_COUNT sectors of a tree covered)
+    +small yaw shaping while orbiting the current target tree (capped per tree)
+  SAFETY / TERMINATION:
+    −      soft, continuous penalty inside the trunk warning/danger zones (scales with proximity)
+    −0.5   one-shot penalty on first entry into the trunk collision zone
+    −3.0   hard penalty + episode ends, on an actual AirSim collision
+    −2.0   episode ends if the drone leaves the orchard bounding box
 
 """
 
@@ -77,23 +80,17 @@ SCATTER_Y_RANGE = (-9.0, 9.0)
 
 RESET_SLEEP_SCALE = 1.0 / CLOCK_SPEED
 
-# Apple gaze parameters (disabled)
-# ENABLE_APPLE_REWARD = False
-# APPLE_XY_OFFSET   = 1.0    # metres FBLR from trunk centre
-# APPLE_Z_OFFSET    = -2.5   # metres NED (negative = up) from tree actor origin
-# GAZE_HALF_ANGLE   = 30.0   # degrees — forward cone half-angle
-# INSPECT_MIN_DIST  = 0.5    # metres horizontal — too close
-# INSPECT_MAX_DIST  = 2.0    # metres horizontal — too far
-# INSPECT_STEPS     = 3      # consecutive steps in cone → apple collected
-# APPLE_GAZE_REWARD = 2.0    # reward per apple gazed at (less than a ball)
-
 IMG_C, IMG_W, IMG_H = 4, 80, 64   # RGB(3) + depth(1)
 N_IMG = IMG_C * IMG_W * IMG_H
 DEPTH_MAX_M = 20.0                 # clip/normalize depth to [0,1] (near→0, far→1)
-CAMERA_HFOV_DEG      = 90.0                  # must match front_center FOV in settings.json
+CAMERA_HFOV_DEG      = 90.0                  # fallback only; OrchardEnv queries the real
+                                              # front_center FOV from AirSim at connect time
 DEPTH_BLOB_NEAR_N    = 12.0 / DEPTH_MAX_M   # only blobs closer than ~12 m count as trees
 DEPTH_BLOB_MIN_AREA  = 30                    # px; smaller blobs are noise at 64×80
 DEPTH_BLOB_MATCH_DEG = 35.0                  # blob bearing vs GT bearing tolerance (deg)
+GROUND_Z_CLEARANCE_M = 0.5                   # world NED height (matches pointcloud_eval.py's
+                                              # GROUND_CLEARANCE) at/below which a near-mask
+                                              # pixel is treated as ground, not a tree candidate
 STATE_DIM = 9
 OBS_DIM = N_IMG + STATE_DIM
 
@@ -170,55 +167,54 @@ def _generate_coverage_viewpoints(tree_positions_xy):
     return viewpoints
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  APPLE HELPERS  (disabled)
-# ─────────────────────────────────────────────────────────────────────────────
-# def _apple_positions(tree_x, tree_y, tree_z):
-#     """4 apple world-NED positions: front, back, right, left."""
-#     d, dz = APPLE_XY_OFFSET, APPLE_Z_OFFSET
-#     return [
-#         (tree_x + d, tree_y,     tree_z + dz),   # front
-#         (tree_x - d, tree_y,     tree_z + dz),   # back
-#         (tree_x,     tree_y + d, tree_z + dz),   # right
-#         (tree_x,     tree_y - d, tree_z + dz),   # left
-#     ]
+def _quat_to_R(q):
+    """AirSim quaternion -> 3x3 world-frame rotation matrix. Same formula as
+    pointcloud_eval.py's _quat_to_R (duplicated, not imported, to avoid a
+    circular import — pointcloud_eval already imports from this module)."""
+    w, x, y, z = q.w_val, q.x_val, q.y_val, q.z_val
+    return np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
+        [2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+        [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)],
+    ], dtype=np.float64)
 
 
-# def _quat_to_forward_horizontal(q):
-#     """Drone forward direction projected onto horizontal plane (2-D unit vector)."""
-#     w, x, y, z = q.w_val, q.x_val, q.y_val, q.z_val
-#     fx   = 1 - 2*(y*y + z*z)
-#     fy   = 2*(x*y + w*z)
-#     norm = math.sqrt(fx*fx + fy*fy) + 1e-9
-#     return fx/norm, fy/norm
-
-
-# def _in_inspection_cone(drone_pos, fwd_x, fwd_y, apple_pos):
-#     """
-#     Horizontal-only cone check.
-#     Returns (in_cone: bool, horiz_dist: float)
-#     """
-#     dx         = apple_pos[0] - drone_pos[0]
-#     dy         = apple_pos[1] - drone_pos[1]
-#     horiz_dist = math.sqrt(dx*dx + dy*dy)
-#     if horiz_dist < 1e-6:
-#         return False, 0.0
-#     dot        = fwd_x*(dx/horiz_dist) + fwd_y*(dy/horiz_dist)
-#     cos_thresh = math.cos(math.radians(GAZE_HALF_ANGLE))
-#     in_cone    = dot > cos_thresh and INSPECT_MIN_DIST <= horiz_dist <= INSPECT_MAX_DIST
-#     return in_cone, horiz_dist
-
-
-def _depth_blob_bearings(depth_n):
+def _depth_blob_bearings(depth_n, hfov_deg=CAMERA_HFOV_DEG, cam_pose=None, intrinsics=None):
     """从归一化深度图(HxW,近→0 远→1)提取候选树 blob。
     返回 [(bearing_rad, dist_m, area_px), ...];bearing +右/-左,相对相机朝向(=body frame)。
-    纯几何,零学习——就是真机 RGB-D 感知模块会输出的东西。"""
+    纯几何,零学习——就是真机 RGB-D 感知模块会输出的东西。
+    hfov_deg should be the camera's actual queried FOV (OrchardEnv.camera_hfov_deg);
+    the module-level constant is only a fallback for standalone/offline use.
+
+    cam_pose: optional (cam_pos_xyz, cam_R) — this frame's real camera world
+    position (3,) and world-frame rotation matrix (3x3). intrinsics: optional
+    (fx, fy, cx, cy) for this depth_n grid. When both are given, near-mask
+    pixels are back-projected to world Z and any at/below GROUND_Z_CLEARANCE_M
+    are dropped before connected-components — without this, a ~level camera a
+    few metres up sees the ground plane well within DEPTH_BLOB_NEAR_N and it
+    gets connected-component'd into one huge "tree" (confirmed empirically:
+    full-width, bottom-touching blobs at ~5m in real runs). Only evaluated on
+    near-mask pixels (a small fraction of the image), not the whole frame, so
+    it stays cheap enough for the per-step training loop."""
     h, w = depth_n.shape
-    mask = (depth_n < DEPTH_BLOB_NEAR_N).astype(np.uint8)
+    near = depth_n < DEPTH_BLOB_NEAR_N
+
+    if cam_pose is not None and intrinsics is not None and near.any():
+        cam_pos, cam_R = cam_pose
+        fx, fy, cx, cy = intrinsics
+        vs, us = np.nonzero(near)
+        z_c = depth_n[vs, us].astype(np.float64) * DEPTH_MAX_M   # forward (DepthPlanar)
+        x_c = (us - cx) / fx * z_c                                # right
+        y_c = (vs - cy) / fy * z_c                                # down
+        pts_w = np.stack([z_c, x_c, y_c], axis=1) @ cam_R.T + cam_pos
+        is_ground = pts_w[:, 2] > -GROUND_Z_CLEARANCE_M           # NED: not clearly above ground
+        near[vs[is_ground], us[is_ground]] = False
+
+    mask = near.astype(np.uint8)
     if mask.sum() == 0:
         return []
     n_lbl, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    half_fov = math.radians(CAMERA_HFOV_DEG) * 0.5
+    half_fov = math.radians(hfov_deg) * 0.5
     blobs = []
     for lbl in range(1, n_lbl):                        # 0 = background
         area = int(stats[lbl, cv2.CC_STAT_AREA])
@@ -252,6 +248,32 @@ class OrchardEnv(gym.Env):
 
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
+
+        try:
+            self.camera_hfov_deg = self.client.simGetCameraInfo("front_center").fov
+        except Exception:
+            self.camera_hfov_deg = CAMERA_HFOV_DEG
+        if abs(self.camera_hfov_deg - CAMERA_HFOV_DEG) > 0.5:
+            print(f"[ENV][WARN] front_center FOV from AirSim ({self.camera_hfov_deg:.1f}deg) "
+                  f"differs from CAMERA_HFOV_DEG constant ({CAMERA_HFOV_DEG:.1f}deg) — "
+                  f"using the queried value.")
+
+        # (fx, fy, cx, cy) for the resized (IMG_W x IMG_H) depth grid, used to
+        # back-project near-mask pixels to world Z for ground filtering in
+        # _depth_blob_bearings. Lazily cached on the first valid depth frame
+        # in _get_obs() — native capture resolution isn't known until then.
+        self._blob_intrinsics = None
+
+        # Camera's rigid mount offset relative to the vehicle body (position
+        # and rotation), expressed IN BODY-FRAME coordinates — this is a fixed
+        # mechanical property, invariant to how the drone is currently
+        # oriented, so it's measured once (in reset(), once the drone is
+        # stably hovering) and reused every step: cam_world_pose =
+        # body_world_pose composed with this fixed offset, using THAT step's
+        # current body rotation. This avoids a simGetCameraInfo() RPC on every
+        # single step just to re-derive the same rigid relationship.
+        self._cam_mount_pos_offset = None
+        self._cam_mount_R_offset = None
 
         self.observation_space = gym.spaces.Box(
             low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
@@ -296,12 +318,11 @@ class OrchardEnv(gym.Env):
         # collision as "new" if its time_stamp is more recent than this.
         self._collision_ts_baseline = 0
 
-        # Apple gaze state (disabled)
-        # self.apple_trees       = []   # [{'trunk':..., 'apples':[...]}]
-        # self.apple_collected   = []   # [tree_idx][apple_idx] bool
-        # self.gaze_streak       = []   # [tree_idx][apple_idx] int
-
-        # Vector dropout curriculum: probability of zeroing dx/dy in obs
+        # GT-fallback dropout curriculum: probability of zeroing dx/dy in obs
+        # when no depth blob matched the target tree (privileged fallback
+        # only — never touches an already-matched blob reading). Set by an
+        # external curriculum callback (e.g. train_rl_depth.py's
+        # VectorDropoutCallback); stays 0.0 (off) unless something drives it.
         self.vector_dropout_p = 0.0
 
     # ------------------------------------------------------------------ #
@@ -655,6 +676,23 @@ class OrchardEnv(gym.Env):
             f"alt={cruise_alt:.3f}m"
         )
 
+        # One-time camera mount calibration, done here (drone stably hovering)
+        # rather than in __init__ (pre-arm pose is less trustworthy). See the
+        # attribute comments in __init__ for why this is safe to cache.
+        if self._cam_mount_pos_offset is None:
+            cam_info = self.client.simGetCameraInfo("front_center")
+            body_R = _quat_to_R(cruise_pose.orientation)
+            body_pos = np.array([cruise_pose.position.x_val,
+                                  cruise_pose.position.y_val,
+                                  cruise_pose.position.z_val], dtype=np.float64)
+            cam_pos0 = np.array([cam_info.pose.position.x_val,
+                                  cam_info.pose.position.y_val,
+                                  cam_info.pose.position.z_val], dtype=np.float64)
+            self._cam_mount_pos_offset = body_R.T @ (cam_pos0 - body_pos)
+            self._cam_mount_R_offset = body_R.T @ _quat_to_R(cam_info.pose.orientation)
+            print(f"[ENV] Calibrated camera mount offset (body frame): "
+                  f"{self._cam_mount_pos_offset.round(3).tolist()}")
+
         trees = _get_tree_positions(self.client)
 
         if VERBOSE_ENV_DEBUG:
@@ -702,23 +740,11 @@ class OrchardEnv(gym.Env):
         self._last_done_reason       = None
         self._prev_cmd_action        = np.zeros(3, dtype=np.float32)
 
-        # Apple gaze init (disabled)
-        # self.apple_trees = []
-        # for tx, ty, tz in trees:
-        #     self.apple_trees.append({
-        #         'trunk':  (tx, ty, tz),
-        #         'apples': _apple_positions(tx, ty, tz),
-        #     })
-        # n = len(self.apple_trees)
-        # self.apple_collected = [[False]*4 for _ in range(n)]
-        # self.gaze_streak     = [[0]*4     for _ in range(n)]
-
         self._visualize_viewpoints()
 
         print(f"[ENV] Reset — spawn_z={self.spawn_z:.2f}  "
               f"trees={len(self.tree_positions_xy)}  "
               f"viewpoints={len(self.viewpoints)}  "
-              # f"apples={n*4}  "
               f"mission=inspect_all_trees  "
               f"max_x_bound={self.max_x_bound:.1f}  "
               f"y_bounds=[{self.min_y_bound:.1f}, {self.max_y_bound:.1f}]")
@@ -786,6 +812,16 @@ class OrchardEnv(gym.Env):
         vx_world = cos_yaw * vx_body - sin_yaw * vy_body
         vy_world = sin_yaw * vx_body + cos_yaw * vy_body
 
+        # Fire-and-forget: do NOT .join() here. moveByVelocityAsync's duration
+        # is a timeout — once it elapses with no fresh command, the controller
+        # relaxes toward hover. Blocking on .join() means Python only issues
+        # the next command after this one's duration has fully elapsed, so
+        # the (non-zero) time spent in _get_obs()/_compute_reward() below runs
+        # with no active command at all, producing a hover/relax pulse every
+        # step. Not joining lets that compute happen while this command is
+        # still driving the vehicle; the next step's command overrides it
+        # before CONTROL_DT would time out, as long as one step's Python-side
+        # work stays under CONTROL_DT (real seconds, i.e. CONTROL_DT/ClockSpeed).
         self.client.moveByVelocityAsync(
             vx_world,
             vy_world,
@@ -795,10 +831,15 @@ class OrchardEnv(gym.Env):
                 is_rate=True,
                 yaw_or_rate=yaw_rate
             )
-        ).join()
+        )
 
-        obs                = self._get_obs()
-        reward, terminated = self._compute_reward()
+        # One shared state fetch for both obs and reward — they used to each
+        # fetch their own (2 extra RPC round-trips per step for a reading
+        # that's only a few ms apart from this one anyway). Timing use below
+        # still uses the pre-command `state` from above, unchanged.
+        post_state          = self.client.getMultirotorState()
+        obs                = self._get_obs(post_state)
+        reward, terminated = self._compute_reward(post_state)
 
         sim_t = state.timestamp * 1e-9 if getattr(state, "timestamp", 0) else None
         if sim_t is None:
@@ -841,7 +882,7 @@ class OrchardEnv(gym.Env):
     # ------------------------------------------------------------------ #
     #  OBSERVATION
     # ------------------------------------------------------------------ #
-    def _get_obs(self):
+    def _get_obs(self, state=None):
         img = None
         depth = None
         for attempt in range(5):
@@ -859,6 +900,13 @@ class OrchardEnv(gym.Env):
                 img = raw.reshape(r_rgb.height, r_rgb.width, 3)
                 depth = np.array(r_depth.image_data_float, dtype=np.float32)
                 depth = depth.reshape(r_depth.height, r_depth.width)
+
+                if self._blob_intrinsics is None:
+                    fx_native = (r_depth.width / 2.0) / math.tan(math.radians(self.camera_hfov_deg) / 2.0)
+                    fx = fx_native * (IMG_W / float(r_depth.width))
+                    fy = fx_native * (IMG_H / float(r_depth.height))   # square pixels natively
+                    self._blob_intrinsics = (fx, fy, IMG_W / 2.0, IMG_H / 2.0)
+
                 break
             time.sleep(0.05 * RESET_SLEEP_SCALE)
 
@@ -883,7 +931,8 @@ class OrchardEnv(gym.Env):
         rgbd = np.concatenate([img_rgb, depth_n[..., None]], axis=2)  # HxWx4
         img_flat = np.transpose(rgbd, (2, 0, 1)).flatten()            # CHW flatten
 
-        state = self.client.getMultirotorState()
+        if state is None:
+            state = self.client.getMultirotorState()
         v     = state.kinematics_estimated.linear_velocity
         pos   = state.kinematics_estimated.position
         ori   = state.kinematics_estimated.orientation
@@ -911,6 +960,11 @@ class OrchardEnv(gym.Env):
         alt_n = float(np.clip(alt / 5.0, 0.0, 1.0))
         yaw_rate_n = float(np.clip(yaw_rate / MAX_YAW_RATE_RAD, -1.0, 1.0))
 
+        # ── Nearest un-visited viewpoint marker — HUD only ──────────────────
+        # Does NOT feed the observation below. Kept only so the debug overlay
+        # can show which sector marker is coming up next; the reward's ORACLE
+        # tri-condition check and the approach vector both work directly off
+        # the tree center + sector index, not off this marker's position.
         candidate_balls = []
         if self.target_tree_idx < len(self.tree_positions_xy):
             prefix = f"tree{self.target_tree_idx}_sec"
@@ -918,8 +972,6 @@ class OrchardEnv(gym.Env):
                 b for b in self.viewpoints
                 if (not b["collected"]) and b["label"].startswith(prefix)
             ]
-        else:
-            candidate_balls = []
 
         nearest_ball      = None
         nearest_ball_dist = float("inf")
@@ -929,53 +981,73 @@ class OrchardEnv(gym.Env):
                 nearest_ball_dist = d
                 nearest_ball = ball
 
-        if nearest_ball is not None:
-            dx_world = nearest_ball["bx"] - drone_x
-            dy_world = nearest_ball["by"] - drone_y
-            dx_body = cos_yaw * dx_world + sin_yaw * dy_world
-            dy_body = -sin_yaw * dx_world + cos_yaw * dy_world
-            dx_body_n = float(np.clip(dx_body / 10.0, -1.0, 1.0))
-            dy_body_n = float(np.clip(dy_body / 10.0, -1.0, 1.0))
-        else:
-            dx_body = 0.0
-            dy_body = 0.0
-            dx_body_n = 0.0
-            dy_body_n = 0.0
-
-        # ── Approach bearing: depth blob(真机风格)+ GT fallback ──────────────
-        # dx_body_n/dy_body_n 是指向目标树最近未收集 viewpoint 的 GT 特权向量。
-        # 目标树在深度图里可见时,用 blob 方位替换它;只有目标出视野(比如背对着)才退回 GT。
+        # ── Approach bearing: depth blob (真机风格) + GT tree-center fallback ──
+        # Primary: bearing/distance to the target tree's TRUNK from a depth
+        # blob (real sensor — what an onboard detector would give at deploy
+        # time). Fallback: when the target tree isn't visible as a blob (out
+        # of range/FOV, occluded), use the privileged GT direction to the
+        # SAME referent — the tree center, not a viewpoint-marker point 4m out
+        # on some sector — so this feature means the same physical thing
+        # regardless of which branch supplied it. "Which sector is still
+        # unvisited" is left to the per-sector reward shaping and the LSTM's
+        # memory, not smuggled into this vector via a marker position.
         # LSTM 负责平滑 blob 的逐帧抖动——正是无记忆 policy 做不到的那一点。
-        gt_dx_n, gt_dy_n = dx_body_n, dy_body_n
-
+        dx_body, dy_body = 0.0, 0.0
         matched_blob = None
+
         if self.target_tree_idx < len(self.tree_positions_xy):
             ttx, tty = self.tree_positions_xy[self.target_tree_idx]
             tdx_w, tdy_w = ttx - drone_x, tty - drone_y
-            fwd =  cos_yaw * tdx_w + sin_yaw * tdy_w
-            rgt = -sin_yaw * tdx_w + cos_yaw * tdy_w
-            gt_bearing = math.atan2(rgt, fwd)   # GT bearing 只用来在多个 blob 里挑目标那棵
+            gt_dx_body =  cos_yaw * tdx_w + sin_yaw * tdy_w   # forward
+            gt_dy_body = -sin_yaw * tdx_w + cos_yaw * tdy_w   # right
+            gt_bearing = math.atan2(gt_dy_body, gt_dx_body)   # picks the right blob among several
+
+            # Camera world pose from the body pose we already have + the fixed
+            # mount offset calibrated once in reset() — no extra RPC needed.
+            # body_R is recomputed fresh from this step's actual orientation,
+            # so pitch/roll from acceleration/maneuvering is fully accounted
+            # for; only the mount's offset-in-body-frame is cached, and that
+            # never changes regardless of how the drone is oriented.
+            cam_pose = None
+            if self._blob_intrinsics is not None and self._cam_mount_pos_offset is not None:
+                body_R = _quat_to_R(ori)
+                body_pos = np.array([pos.x_val, pos.y_val, pos.z_val], dtype=np.float64)
+                cam_pos = body_pos + body_R @ self._cam_mount_pos_offset
+                cam_R = body_R @ self._cam_mount_R_offset
+                cam_pose = (cam_pos, cam_R)
 
             best_err = math.radians(DEPTH_BLOB_MATCH_DEG)
-            for bearing, dist, _area in _depth_blob_bearings(depth_n):
+            for bearing, dist, _area in _depth_blob_bearings(
+                depth_n, self.camera_hfov_deg,
+                cam_pose=cam_pose, intrinsics=self._blob_intrinsics,
+            ):
                 err = abs((bearing - gt_bearing + math.pi) % (2 * math.pi) - math.pi)
                 if err < best_err:
                     best_err = err
                     matched_blob = (bearing, dist)
 
-        if matched_blob is not None:
-            bearing, dist = matched_blob
-            dx_body_n = float(np.clip(dist * math.cos(bearing) / 10.0, -1.0, 1.0))
-            dy_body_n = float(np.clip(dist * math.sin(bearing) / 10.0, -1.0, 1.0))
-        else:
-            dx_body_n, dy_body_n = gt_dx_n, gt_dy_n
+            if matched_blob is not None:
+                bearing, dist = matched_blob
+                dx_body, dy_body = dist * math.cos(bearing), dist * math.sin(bearing)
+            else:
+                dx_body, dy_body = gt_dx_body, gt_dy_body
+
+        dx_body_n = float(np.clip(dx_body / 10.0, -1.0, 1.0))
+        dy_body_n = float(np.clip(dy_body / 10.0, -1.0, 1.0))
+
+        # GT-fallback dropout curriculum: only ever drops the privileged
+        # fallback. A matched blob reading is already sensor-grounded, so it
+        # is never zeroed out here.
+        if (
+            matched_blob is None
+            and self.vector_dropout_p > 0.0
+            and random.random() < self.vector_dropout_p
+        ):
+            dx_body_n, dy_body_n = 0.0, 0.0
 
         # Orbit gate: zero the approach vector near the tree → force visual orbiting
         ORBIT_GATE_RADIUS = 6.0 #VIEWPOINT_RADIUS + 2.0
         if d_to_target_tree < ORBIT_GATE_RADIUS:
-            dx_body_n, dy_body_n = 0.0, 0.0
-
-        if self.vector_dropout_p > 0.0 and random.random() < self.vector_dropout_p:
             dx_body_n, dy_body_n = 0.0, 0.0
 
         self._last_state_info = {
@@ -985,8 +1057,8 @@ class OrchardEnv(gym.Env):
             "alt": alt,
             "yaw": yaw,
             "yaw_rate": yaw_rate,
-            "dx_body": dx_body if nearest_ball is not None else 0.0,
-            "dy_body": dy_body if nearest_ball is not None else 0.0,
+            "dx_body": dx_body,
+            "dy_body": dy_body,
             "nearest_ball_label": nearest_ball["label"] if nearest_ball is not None else None,
             "nearest_ball_dist": nearest_ball_dist if nearest_ball is not None else None,
             "target_tree_idx": self.target_tree_idx,
@@ -1027,13 +1099,13 @@ class OrchardEnv(gym.Env):
     # ------------------------------------------------------------------ #
     #  REWARD
     # ------------------------------------------------------------------ #
-    def _compute_reward(self):
-        state   = self.client.getMultirotorState()
+    def _compute_reward(self, state=None):
+        if state is None:
+            state = self.client.getMultirotorState()
         pos     = state.kinematics_estimated.position
         ori     = state.kinematics_estimated.orientation
         drone_x = pos.x_val
         drone_y = pos.y_val
-        # drone_pos = [pos.x_val, pos.y_val, pos.z_val]  # Apple gaze only.
 
         reward     = 0.0
         terminated = False
@@ -1192,27 +1264,6 @@ class OrchardEnv(gym.Env):
             self._last_done_reason = "out_of_y_min"
             reward -= 2.0
 
-        # ── Apple gaze bonus (disabled while debugging tree progression) ──
-        # if ENABLE_APPLE_REWARD and not terminated:
-        #     fwd_x, fwd_y = _quat_to_forward_horizontal(ori)
-        #     for ti, tree in enumerate(self.apple_trees):
-        #         for ai, apple_pos in enumerate(tree['apples']):
-        #             if self.apple_collected[ti][ai]:
-        #                 continue
-        #             in_cone, hdist = _in_inspection_cone(
-        #                 drone_pos, fwd_x, fwd_y, apple_pos)
-        #             if in_cone:
-        #                 self.gaze_streak[ti][ai] += 1
-        #                 if self.gaze_streak[ti][ai] >= INSPECT_STEPS:
-        #                     self.apple_collected[ti][ai] = True
-        #                     self.gaze_streak[ti][ai]     = 0
-        #                     reward += APPLE_GAZE_REWARD
-        #                     print(f"[APPLE] Gazed tree{ti} apple{ai}  "
-        #                           f"dist={hdist:.2f}m  +{APPLE_GAZE_REWARD}")
-        #             else:
-        #                 self.gaze_streak[ti][ai] = max(
-        #                     0, self.gaze_streak[ti][ai] - 1)
-
         return reward, terminated
 
     # ------------------------------------------------------------------ #
@@ -1256,9 +1307,6 @@ class OrchardEnv(gym.Env):
         s   = self._last_state_info
         collected = sum(1 for b in self.viewpoints if b["collected"])
         total     = len(self.viewpoints)
-        # apples_collected = sum(self.apple_collected[ti][ai]
-        #                        for ti in range(len(self.apple_trees))
-        #                        for ai in range(4))
 
         if SHOW_DEBUG_OVERLAY:
             cv2.putText(vis,
@@ -1279,7 +1327,6 @@ class OrchardEnv(gym.Env):
         if reward is not None:
             cv2.putText(vis,
                 f"REW: {reward:.3f}  VIEWS: {collected}/{total}  "
-                # f"APPLES: {apples_collected}/{len(self.apple_trees)*4}  "
                 f"STEP: {self.step_count}  DROP: {self.vector_dropout_p:.2f}",
                 (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 128), 2)
 

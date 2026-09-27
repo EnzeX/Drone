@@ -16,6 +16,11 @@ import airsim
 from sb3_contrib import RecurrentPPO
 from orchard_env import OrchardEnv
 from pointcloud_eval import BUDGET_TARGETS, PointCloudAccumulator
+# Import needed so RecurrentPPO.load() can resolve the custom feature extractor
+# referenced in the checkpoint's policy_kwargs. Not called directly here, but
+# don't remove it — without it, loading depends on cloudpickle happening to
+# have embedded the class by value instead of by reference.
+from rl_policy import ImageStateFeatureExtractor  # noqa: F401
 
 MODEL_PATH = os.path.expanduser("~/bc_data/rl_models/slalom_ppo_lstm_final")
 SAVE_DIR   = os.path.expanduser("~/bc_data/rl_models")
